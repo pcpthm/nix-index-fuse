@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{btree_map, BTreeMap, HashMap},
     ffi::{CStr, CString, OsStr},
     os::unix::prelude::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OsStrExt, OsStringExt, OwnedFd},
     path::{Path, PathBuf},
@@ -82,14 +82,14 @@ fn parse_entry<'a>(cur: &mut &'a [u8]) -> anyhow::Result<(EntryMeta, i32, &'a [u
 
 #[derive(Debug)]
 enum Node {
-    Dummy,
+    EmptySpace,
     RegularFile {
         size: u64,
         executable: bool,
     },
     Directory {
         size: u64,
-        children: Box<[(LeakStr, usize)]>,
+        children: &'static [(LeakStr, usize)],
     },
     Symlink {
         target: LeakStr,
@@ -117,17 +117,23 @@ impl DirectoryBuilder {
             self.name,
             Node::Directory {
                 size: self.size,
-                children: self.children.into_boxed_slice(),
+                children: self.children.leak(),
             },
         )
     }
+}
+
+fn alloc_node(nodes: &mut Vec<Node>, node: Node) -> usize {
+    let i = nodes.len();
+    nodes.push(node);
+    i
 }
 
 fn parse_package(cur: &mut &[u8], nodes: &mut Vec<Node>) -> anyhow::Result<(Package, usize)> {
     let mut last_suffix = &b""[..];
     let mut dir_stack: Vec<DirectoryBuilder> = vec![];
     let mut top_dir = DirectoryBuilder::new(b"".as_bstr(), 0);
-    let mut last_node: Node = Node::Dummy;
+    let mut last_node: Node = Node::EmptySpace;
     let mut last_name: BString = BString::default();
 
     loop {
@@ -144,11 +150,10 @@ fn parse_package(cur: &mut &[u8], nodes: &mut Vec<Node>) -> anyhow::Result<(Pack
             dir_stack.push(top_dir);
             top_dir = new_top_dir;
             last_name = BString::from(rest);
-        } else if !matches!(last_node, Node::Dummy) {
+        } else if !matches!(last_node, Node::EmptySpace) {
             let mut last_len = last_name.len();
             {
-                let index = nodes.len();
-                nodes.push(last_node);
+                let index = alloc_node(&mut *nodes, last_node);
                 let last_name = <Vec<u8>>::from(last_name.clone()).leak().as_bstr();
                 top_dir.children.push((last_name, index));
             }
@@ -161,8 +166,7 @@ fn parse_package(cur: &mut &[u8], nodes: &mut Vec<Node>) -> anyhow::Result<(Pack
 
                 let mut new_top_dir = dir_stack.pop().context("malformed file tree")?;
                 let (name, node) = top_dir.finish();
-                let index = nodes.len();
-                nodes.push(node);
+                let index = alloc_node(&mut *nodes, node);
                 new_top_dir.children.push((name, index));
                 top_dir = new_top_dir;
             }
@@ -179,7 +183,7 @@ fn parse_package(cur: &mut &[u8], nodes: &mut Vec<Node>) -> anyhow::Result<(Pack
             EntryMeta::Symlink { target } => Node::Symlink { target },
             EntryMeta::Directory { size } => Node::Directory {
                 size,
-                children: Box::new([]),
+                children: &[],
             },
             EntryMeta::Package => {
                 break;
@@ -193,6 +197,47 @@ fn parse_package(cur: &mut &[u8], nodes: &mut Vec<Node>) -> anyhow::Result<(Pack
     let root = top_dir.children[0].1;
     let package = serde_json::from_slice(last_suffix)?;
     Ok((package, root))
+}
+
+fn follow_path(mut node: usize, path: &[&[u8]], nodes: &[Node]) -> Option<usize> {
+    for &part in path {
+        if let Node::Directory { children, .. } = &nodes[node] {
+            node = children.iter().find(|x| x.0 == part)?.1;
+        } else {
+            return None;
+        }
+    }
+    Some(node)
+}
+
+fn make_env(roots: &[(LeakStr, usize)], path: &[&[u8]], nodes: &mut Vec<Node>) -> usize {
+    let mut links = BTreeMap::new();
+    for &(name, root) in roots {
+        let mut common_prefix = PathBuf::from("..");
+        common_prefix.push(OsStr::from_bytes(name));
+        for part in path {
+            common_prefix.push(OsStr::from_bytes(part));
+        }
+        if let Some(node) = follow_path(root, path, nodes) {
+            if let Node::Directory { children, .. } = &nodes[node] {
+                for &(name, _) in children.iter() {
+                    if let btree_map::Entry::Vacant(entry) = links.entry(name) {
+                        let target = common_prefix.join(OsStr::from_bytes(name));
+                        let target = target.into_os_string().into_vec().leak().as_bstr();
+                        entry.insert(alloc_node(&mut *nodes, Node::Symlink { target }));
+                    }
+                }
+            }
+        }
+    }
+    let children = links.into_iter().collect::<Vec<_>>();
+    alloc_node(
+        &mut *nodes,
+        Node::Directory {
+            size: 0,
+            children: children.leak(),
+        },
+    )
 }
 
 const TTL: Duration = Duration::from_secs(1);
@@ -230,10 +275,8 @@ fn create_attr(ino: u64, size: u64, kind: FileType, perm: u16) -> FileAttr {
 
 struct Fs {
     nodes: Vec<Node>,
-    packages: Vec<(Package, usize)>,
     lookup_index: HashMap<(u64, LeakStr), usize>,
-    parent_node: Vec<Option<(LeakStr, usize)>>,
-    root_to_package: HashMap<usize, usize>,
+    parent_node: Vec<(LeakStr, usize)>,
 
     local_store: OwnedFd,
     open_nodes: HashMap<usize, OwnedFd>,
@@ -290,36 +333,26 @@ fn run_nix_copy(store_path: &Path) -> std::io::Result<()> {
 }
 
 impl Fs {
-    pub fn new(nodes: Vec<Node>, packages: Vec<(Package, usize)>) -> anyhow::Result<Self> {
+    pub fn new(nodes: Vec<Node>) -> anyhow::Result<Self> {
         let mut lookup_index = HashMap::new();
-        let mut parent_node = vec![None; nodes.len()];
-        let mut root_to_package = HashMap::new();
+        let mut parent_node = vec![(b"".as_bstr(), 0); nodes.len()];
 
-        for (i, &(ref package, root)) in packages.iter().enumerate() {
-            let name = format!("{}-{}", package.hash, package.name)
-                .into_bytes()
-                .leak()
-                .as_bstr();
-            lookup_index.insert((FUSE_ROOT_ID, name), root);
-            parent_node[root] = Some((name, ROOT_ID));
-            root_to_package.insert(root, i);
-        }
+        parent_node[ROOT_ID].1 = ROOT_ID;
 
         for (i, node) in nodes.iter().enumerate() {
-            if let Node::Directory { children, .. } = node {
-                for &(name, child) in children.iter() {
+            if let &Node::Directory { children, .. } = node {
+                for &(name, child) in children {
                     lookup_index.insert((i as u64, name), child);
-                    assert!(parent_node[child].is_none());
-                    parent_node[child] = Some((name, i));
+                    assert!(parent_node[child].1 == 0);
+                    parent_node[child] = (name, i);
                 }
             }
         }
+
         Ok(Self {
             nodes,
-            packages,
             lookup_index,
             parent_node,
-            root_to_package,
 
             local_store: open_dir(PathBuf::from("/nix/store"))?,
             open_nodes: HashMap::new(),
@@ -327,12 +360,7 @@ impl Fs {
     }
 
     fn is_node(&self, ino: u64) -> bool {
-        ino < self.nodes.len() as u64 && !matches!(self.nodes[ino as usize], Node::Dummy)
-    }
-
-    fn attr_root(&self) -> FileAttr {
-        let size = self.nodes.len() as u64 * std::mem::size_of::<Node>() as u64;
-        create_attr(FUSE_ROOT_ID, size, FileType::Directory, DIR_PERM)
+        ino < self.nodes.len() as u64 && !matches!(self.nodes[ino as usize], Node::EmptySpace)
     }
 
     fn attr_node(&self, i: usize) -> FileAttr {
@@ -354,9 +382,9 @@ impl Fs {
                 FileType::Symlink,
                 SYMLINK_PERM,
             ),
-            Node::Dummy => {
+            Node::EmptySpace => {
                 warn!("attr dummy node {}", i);
-                self.attr_root()
+                create_attr(i as u64, 0, FileType::RegularFile, 0)
             }
         }
     }
@@ -366,37 +394,11 @@ impl Fs {
             Node::RegularFile { .. } => FileType::RegularFile,
             Node::Directory { .. } => FileType::Directory,
             Node::Symlink { .. } => FileType::Symlink,
-            Node::Dummy => {
+            Node::EmptySpace => {
                 warn!("file type dummy node {}", i);
                 FileType::RegularFile
             }
         }
-    }
-
-    fn readdir_root(&mut self, offset: usize, mut reply: fuser::ReplyDirectory) {
-        if offset == 0 && reply.add(FUSE_ROOT_ID, 1, FileType::Directory, ".") {
-            return reply.ok();
-        }
-        if offset <= 1 && reply.add(FUSE_ROOT_ID, 2, FileType::Directory, "..") {
-            return reply.ok();
-        }
-
-        for (i, &(_, root)) in self
-            .packages
-            .iter()
-            .enumerate()
-            .skip(offset.saturating_sub(2))
-        {
-            let next_offset = 2 + i as i64 + 1;
-            let kind = self.file_type_node(root);
-            if let Some((name, _)) = self.parent_node[root] {
-                if reply.add(root as u64, next_offset, kind, OsStr::from_bytes(name)) {
-                    return reply.ok();
-                }
-            }
-        }
-
-        reply.ok()
     }
 
     fn readdir_node(&mut self, node: usize, offset: usize, mut reply: fuser::ReplyDirectory) {
@@ -409,10 +411,8 @@ impl Fs {
         if offset == 0 && reply.add(node as u64, 1, FileType::Directory, ".") {
             return reply.ok();
         }
-        let parent = self.parent_node[node]
-            .as_ref()
-            .map_or(FUSE_ROOT_ID, |x| x.1 as u64);
-        if offset <= 1 && reply.add(parent, 2, FileType::Directory, "..") {
+        let parent = self.parent_node[node].1;
+        if offset <= 1 && reply.add(parent as u64, 2, FileType::Directory, "..") {
             return reply.ok();
         }
 
@@ -435,22 +435,20 @@ impl Fs {
         }
     }
 
-    fn get_package_and_path(&self, mut node: usize) -> Option<(&Package, PathBuf)> {
+    fn get_path(&self, mut node: usize) -> Option<PathBuf> {
         let mut parts = Vec::new();
         loop {
-            let (part, parent) = self.parent_node[node]?;
+            let (part, parent) = self.parent_node[node];
             if parent == 0 || parent == node {
                 return None;
             }
             parts.push(part);
             if parent == ROOT_ID {
-                let package_id = *self.root_to_package.get(&node)?;
-                let package = &self.packages[package_id].0;
                 let mut buf = PathBuf::new();
                 for &part in parts.iter().rev() {
                     buf.push(OsStr::from_bytes(part));
                 }
-                return Some((package, buf));
+                return Some(buf);
             }
             node = parent;
         }
@@ -477,10 +475,10 @@ impl Fs {
             return reply.opened(0, 0);
         }
 
-        let (_package, path) = match self.get_package_and_path(node) {
+        let path = match self.get_path(node) {
             Some(ok) => ok,
             None => {
-                log::error!("get_package_and_path failed for node {}", node);
+                log::error!("get_path failed for node {}", node);
                 return reply.error(ENOENT);
             }
         };
@@ -569,11 +567,6 @@ impl fuser::Filesystem for Fs {
     }
 
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
-        if ino == FUSE_ROOT_ID {
-            let attr = self.attr_root();
-            return reply.attr(&TTL, &attr);
-        }
-
         if self.is_node(ino) {
             let attr = self.attr_node(ino as usize);
             return reply.attr(&TTL, &attr);
@@ -592,10 +585,6 @@ impl fuser::Filesystem for Fs {
     ) {
         assert!(offset >= 0);
         let offset = offset.min(isize::MAX as i64) as usize;
-
-        if ino == FUSE_ROOT_ID {
-            return self.readdir_root(offset, reply);
-        }
 
         if self.is_node(ino) {
             return self.readdir_node(ino as usize, offset, reply);
@@ -680,18 +669,43 @@ fn main() -> anyhow::Result<()> {
     // Could make multi-threaded by finding b"p\0" (not a 2-byte prefix length diff because path cannot be that long)
     let mut cur = &db_raw[..];
 
-    let mut nodes = vec![Node::Dummy, Node::Dummy];
-    let mut packages = Vec::new();
+    let mut nodes = vec![Node::EmptySpace, Node::EmptySpace];
+    let mut root_children = Vec::new();
+
     while !cur.is_empty() {
-        packages.push(parse_package(&mut cur, &mut nodes).context("failed to parse database")?);
+        let (package, node) =
+            parse_package(&mut cur, &mut nodes).context("failed to parse database")?;
+
+        let name = format!("{}-{}", package.hash, package.name)
+            .into_bytes()
+            .leak()
+            .as_bstr();
+        root_children.push((name, node));
+
         #[cfg(debug_assertions)]
-        if packages.len() > 100 {
+        if root_children.len() > 100 {
             break;
         }
     }
-    println!("{} packages parsed ({} nodes)", packages.len(), nodes.len());
 
-    let fs = Fs::new(nodes, packages)?;
+    println!(
+        "{} packages parsed ({} nodes)",
+        root_children.len(),
+        nodes.len()
+    );
+
+    let bin_env = make_env(&root_children, &[b"bin"], &mut nodes);
+    let lib_env = make_env(&root_children, &[b"lib"], &mut nodes);
+    root_children.push((b"bin".as_bstr(), bin_env));
+    root_children.push((b"lib".as_bstr(), lib_env));
+
+    let root_children = &*root_children.leak();
+    nodes[ROOT_ID] = Node::Directory {
+        size: 0,
+        children: root_children,
+    };
+
+    let fs = Fs::new(nodes)?;
     let mountpoint = PathBuf::from("/run/user/1000/fs");
 
     fuser::mount2(
