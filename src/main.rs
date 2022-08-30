@@ -1,8 +1,9 @@
 use anyhow::bail;
+use clap::Parser;
 use fusetest::{
     self,
     db::{self, EntryMeta, TreeDecoder},
-    tree::{ChildRef, DirId, Tree},
+    tree::{ChildMeta, ChildRef, DirId, Tree},
 };
 mod libc_utils;
 
@@ -70,15 +71,13 @@ fn file_attr(inode: u64, size: u64, kind: FileType, perm: u16) -> FileAttr {
 }
 
 fn child_attr(child: ChildRef, inode: u64) -> FileAttr {
-    let (size, kind, perm) = if let Some((_, size)) = child.as_dir() {
-        (size as u64, FileType::Directory, 0o555)
-    } else if let Some((size, executable)) = child.as_file() {
-        let perm = if executable { 0o555 } else { 0o444 };
-        (size, FileType::RegularFile, perm)
-    } else if let Some(target) = child.as_symlink() {
-        (target.len() as u64, FileType::Symlink, 0o444)
-    } else {
-        panic!("unexpected child type");
+    let (size, kind, perm) = match child.metadata() {
+        ChildMeta::Dir(size) => (size, FileType::Directory, 0o555),
+        ChildMeta::File(size, executable) => {
+            let perm = if executable { 0o555 } else { 0o444 };
+            (size, FileType::RegularFile, perm)
+        }
+        ChildMeta::Symlink(size) => (size, FileType::Symlink, 0o444),
     };
     file_attr(inode, size, kind, perm)
 }
@@ -93,7 +92,7 @@ struct Fs {
 
     inode_end: u64,
 
-    prepared_dirs: HashMap<u64, (DirId, u64)>,
+    prepared_dirs: HashMap<u64, (DirId, u64, usize)>,
     prepared_dir_inode: HashMap<DirId, u64>,
 
     /// Open files in the local store.
@@ -130,26 +129,26 @@ impl Fs {
         None
     }
 
-    pub fn prepare_as_dir(&mut self, inode: u64) -> Option<(DirId, u64)> {
-        if let Some(&(dir, start)) = self.prepared_dirs.get(&inode) {
-            return Some((dir, start));
+    pub fn prepare_as_dir(&mut self, inode: u64) -> Option<(DirId, u64, usize)> {
+        if let Some(&(dir, start, len)) = self.prepared_dirs.get(&inode) {
+            return Some((dir, start, len));
         }
         let (_, child) = self.get_tree_node(inode)?;
-        let (dir, capacity) = child.as_dir()?;
+        let dir = child.as_dir()?;
+        let len = self.tree.prepare(dir);
+
         let start = self.inode_end;
-
         self.inode_ranges.push((start, dir));
-        self.inode_end = start + capacity as u64;
+        self.inode_end = start + len as u64;
 
-        self.prepared_dirs.insert(inode, (dir, start));
+        self.prepared_dirs.insert(inode, (dir, start, len));
         self.prepared_dir_inode.insert(dir, inode);
 
-        self.tree.prepare(dir);
-        Some((dir, start))
+        Some((dir, start, len))
     }
 
     fn get_dot_dot(&self, dir: DirId) -> u64 {
-        if let Some((parent, _, _)) = self.tree.get_parent(dir) {
+        if let Some((parent, _)) = self.tree.get_parent(dir) {
             *self.prepared_dir_inode.get(&parent).unwrap()
         } else {
             FUSE_ROOT_ID
@@ -159,11 +158,11 @@ impl Fs {
     fn get_path(&self, parent: DirId, child: ChildRef) -> PathBuf {
         let mut path_parts = vec![child.name()];
         let mut dir = parent;
-        while let Some((parent, _, child_ref)) = self.tree.get_parent(dir) {
+        while let Some((parent, child_ref)) = self.tree.get_parent(dir) {
             path_parts.push(child_ref.name());
             dir = parent;
         }
-        let mut path = PathBuf::from("/");
+        let mut path = PathBuf::from("/nix/store/");
         for &part in path_parts.iter().rev() {
             path.push(OsStr::from_bytes(part));
         }
@@ -186,7 +185,7 @@ impl Fs {
 
 impl fuser::Filesystem for Fs {
     fn lookup(&mut self, _: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Some((parent, start)) = self.prepare_as_dir(parent) {
+        if let Some((parent, start, _)) = self.prepare_as_dir(parent) {
             if let Some((index, child)) = self.tree.find_child(parent, name.as_bytes()) {
                 let inode = start + index as u64;
                 let attr = child_attr(child, inode);
@@ -206,7 +205,7 @@ impl fuser::Filesystem for Fs {
 
     fn readdir(&mut self, _: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         assert!(offset >= 0);
-        if let Some((dir, start)) = self.prepare_as_dir(ino) {
+        if let Some((dir, start, len)) = self.prepare_as_dir(ino) {
             let mut offset = offset;
             if offset == 0 {
                 offset += 1;
@@ -220,7 +219,6 @@ impl fuser::Filesystem for Fs {
                     return reply.ok();
                 }
             }
-            let len = self.tree.get_num_children(dir);
             for index in offset.saturating_sub(2).min(len as i64) as usize..len {
                 offset += 1;
                 let inode = start + index as u64;
@@ -299,6 +297,10 @@ impl fuser::Filesystem for Fs {
         }
         reply.error(ENOENT)
     }
+
+    fn destroy(&mut self) {
+        fusetest::tree::print_stats(&self.tree);
+    }
 }
 
 fn add_package_tree(
@@ -322,7 +324,7 @@ fn add_package_tree(
                 tree.add_file(parent, name, size, executable);
             }
             EntryMeta::Dir { child_count } => {
-                let (_, dir) = tree.add_dir(parent, name, child_count);
+                let dir = tree.add_dir(parent, name, child_count);
                 stack.push(dir);
             }
             EntryMeta::Symlink { target } => {
@@ -346,45 +348,98 @@ fn prepare_mount_point(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Parser)]
+#[clap(version)]
+struct Args {
+    #[clap(
+        long = "db",
+        env = "NIX_INDEX_DB",
+        help = "Location of nix-index database file."
+    )]
+    db_path: PathBuf,
+
+    #[clap(help = "Mountpoint to use.")]
+    mount_point: PathBuf,
+
+    #[clap(
+        long = "limit",
+        help = "Limit number of packages to load. Used for debugging."
+    )]
+    limit_num_packages: Option<usize>,
+
+    #[clap(
+        long = "merge-all",
+        help = "Merge all packages.",
+        default_value_t = true
+    )]
+    merge_all: bool,
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    let mount_point = PathBuf::from("/run/user/1000/fs");
-    prepare_mount_point(&mount_point)?;
+    let args = Args::parse();
 
-    let db_path = PathBuf::from("/nix/store/7mlb139kmqxkdy5l880jr8p6jcagra10-index-x86_64-linux");
+    prepare_mount_point(&args.mount_point)?;
 
     let mut tree = Tree::new();
     {
+        println!("Loading database {}...", args.db_path.display());
+
         let instant = Instant::now();
         let (root, _) = tree.get_root();
-        let (_, root_nix) = tree.add_dir(root, b"nix", 1);
-        let (_, root_nix_store) = tree.add_dir(root_nix, b"store", 0);
 
-        let mut decoder = db::Decoder::new(&db_path)?;
-        let mut decoder_buf = db::DecoderBuf::new();
         let mut num_packages = 0;
-        let mut stack = Vec::new();
-        while let Some((decoder, package_meta)) = decoder.next_package(&mut decoder_buf)? {
-            let root_name = package_meta.hash_name();
+        {
+            let mut decoder = db::Decoder::new(&args.db_path)?;
+            let mut decoder_buf = db::DecoderBuf::new();
+            let mut stack = Vec::new();
+            while let Some((decoder, package_meta)) = decoder.next_package(&mut decoder_buf)? {
+                let root_name = package_meta.hash_name();
 
-            stack.clear();
-            stack.push(root_nix_store);
+                stack.clear();
+                stack.push(root);
 
-            add_package_tree(&mut tree, root_name.as_bytes(), &mut stack, decoder)?;
+                add_package_tree(&mut tree, root_name.as_bytes(), &mut stack, decoder)?;
 
-            num_packages += 1;
+                num_packages += 1;
 
-            #[cfg(debug_assertions)]
-            if num_packages >= 100 {
-                break;
+                if let Some(limit) = args.limit_num_packages {
+                    if num_packages >= limit {
+                        break;
+                    }
+                }
             }
         }
-        println!(
+
+        log::info!(
             "Loaded {} packages in {}ms",
             num_packages,
             instant.elapsed().as_millis()
         );
+
+        let instant = Instant::now();
+        {
+            let mut stack = vec![root];
+            while let Some(parent) = stack.pop() {
+                let len = tree.ensure_sorted(parent);
+                for index in 0..len {
+                    if let Some(dir) = tree.get_child(parent, index).as_dir() {
+                        stack.push(dir);
+                    }
+                }
+            }
+        }
+        log::info!("Sorted nodes in {}ms", instant.elapsed().as_millis());
+
+        if args.merge_all {
+            for index in 0..num_packages {
+                if let Some(dir) = tree.get_child(root, index).as_dir() {
+                    tree.add_overlay(root, 0, 1, dir);
+                }
+            }
+        }
+
         fusetest::tree::print_stats(&tree);
     }
 
@@ -393,11 +448,12 @@ fn main() -> anyhow::Result<()> {
     let mut fs = Fs::new(tree, local_store);
     fs.prepare_as_dir(FUSE_ROOT_ID);
 
+    println!("Mounting to {}...", args.mount_point.display());
     fuser::mount2(
         fs,
-        &mount_point,
+        &args.mount_point,
         &[
-            MountOption::FSName("testfs".to_owned()),
+            MountOption::FSName("nixindexfs".to_owned()),
             MountOption::DefaultPermissions,
         ],
     )?;
