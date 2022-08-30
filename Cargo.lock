@@ -144,24 +144,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fusetest"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "atoi",
- "bytes",
- "clap",
- "env_logger",
- "fuser",
- "libc",
- "log",
- "memchr",
- "serde",
- "serde_json",
- "zstd",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,6 +215,24 @@ name = "memchr"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dffe52ecf27772e601905b7522cb4ef790d2cc203488bbd0e2fe85fcb74566d"
+
+[[package]]
+name = "nixindexfs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atoi",
+ "bytes",
+ "clap",
+ "env_logger",
+ "fuser",
+ "libc",
+ "log",
+ "memchr",
+ "serde",
+ "serde_json",
+ "zstd",
+]
 
 [[package]]
 name = "num-traits"

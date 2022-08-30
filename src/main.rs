@@ -1,7 +1,6 @@
 use anyhow::bail;
 use clap::Parser;
-use fusetest::{
-    self,
+use nixindexfs::{
     db::{self, EntryMeta, TreeDecoder},
     tree::{ChildMeta, ChildRef, DirId, Tree},
 };
@@ -29,6 +28,7 @@ fn run_nix_copy(store_path: &Path) -> std::io::Result<()> {
     log::info!("Running nix copy command for {}", store_path.display());
 
     let status = Command::new("nix")
+        .args(["--extra-experimental-features", "nix-command"])
         .args(["copy", "--from", "https://cache.nixos.org/"])
         .arg(store_path)
         .spawn()?
@@ -299,7 +299,7 @@ impl fuser::Filesystem for Fs {
     }
 
     fn destroy(&mut self) {
-        fusetest::tree::print_stats(&self.tree);
+        nixindexfs::tree::print_stats(&self.tree);
     }
 }
 
@@ -440,7 +440,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        fusetest::tree::print_stats(&tree);
+        nixindexfs::tree::print_stats(&tree);
     }
 
     let local_store = open_dir("/nix/store".as_ref())?;
